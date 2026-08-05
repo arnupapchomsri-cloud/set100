@@ -87,42 +87,60 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def classify_signal(df: pd.DataFrame) -> str:
-    """Simple rule-based classification. Returns 'BUY', 'SELL', or 'HOLD'."""
-    if len(df) < 51 or df[["sma20", "sma50", "rsi14", "macd_hist"]].iloc[-2:].isna().any().any():
-        return "N/A (ข้อมูลไม่พอ)"
+def compute_signal_series(df: pd.DataFrame) -> pd.Series:
+    """Compute BUY/SELL/HOLD for every row (not just the latest), using the same
+    3-rule scoring as before, so we can tell how long the current signal has held."""
+    sma20, sma50, rsi14, hist_ = df["sma20"], df["sma50"], df["rsi14"], df["macd_hist"]
 
-    last, prev = df.iloc[-1], df.iloc[-2]
-    score = 0
+    trend = pd.Series(1, index=df.index).where(sma20 > sma50, -1)
 
-    # Trend: SMA20 vs SMA50
-    if last.sma20 > last.sma50:
-        score += 1
-    else:
-        score -= 1
-    # Fresh crossover carries more weight
-    if prev.sma20 <= prev.sma50 and last.sma20 > last.sma50:
-        score += 2  # golden cross
-    if prev.sma20 >= prev.sma50 and last.sma20 < last.sma50:
-        score -= 2  # death cross
+    cross_up = (sma20.shift(1) <= sma50.shift(1)) & (sma20 > sma50)
+    cross_down = (sma20.shift(1) >= sma50.shift(1)) & (sma20 < sma50)
+    trend_bonus = pd.Series(0, index=df.index)
+    trend_bonus[cross_up] = 2
+    trend_bonus[cross_down] = -2
 
-    # RSI
-    if last.rsi14 < 30:
-        score += 1  # oversold -> potential bounce
-    elif last.rsi14 > 70:
-        score -= 1  # overbought -> potential pullback
+    rsi_score = pd.Series(0, index=df.index)
+    rsi_score[rsi14 < 30] = 1
+    rsi_score[rsi14 > 70] = -1
 
-    # MACD momentum
-    if prev.macd_hist <= 0 and last.macd_hist > 0:
-        score += 1
-    if prev.macd_hist >= 0 and last.macd_hist < 0:
-        score -= 1
+    prev_hist = hist_.shift(1)
+    macd_up = (prev_hist <= 0) & (hist_ > 0)
+    macd_down = (prev_hist >= 0) & (hist_ < 0)
+    macd_score = pd.Series(0, index=df.index)
+    macd_score[macd_up] = 1
+    macd_score[macd_down] = -1
 
-    if score >= 2:
-        return "BUY"
-    elif score <= -2:
-        return "SELL"
-    return "HOLD"
+    score = trend + trend_bonus + rsi_score + macd_score
+
+    signal = pd.Series("HOLD", index=df.index)
+    signal[score >= 2] = "BUY"
+    signal[score <= -2] = "SELL"
+
+    # not enough warm-up data yet (SMA50/RSI/MACD need history) -> N/A
+    warmup_ok = df[["sma20", "sma50", "rsi14", "macd_hist"]].notna().all(axis=1) & \
+                df[["sma20", "sma50", "rsi14", "macd_hist"]].shift(1).notna().all(axis=1)
+    signal[~warmup_ok] = "N/A"
+    return signal
+
+
+def current_signal_info(df: pd.DataFrame):
+    """Return (signal, since_date, trading_days_held) for the most recent row,
+    by walking backward while the signal stays the same."""
+    if len(df) < 51:
+        return "N/A", None, 0
+
+    sig = compute_signal_series(df)
+    current = sig.iloc[-1]
+    since_date = sig.index[-1]
+    days = 0
+    for date in sig.index[::-1]:
+        if sig.loc[date] == current:
+            days += 1
+            since_date = date
+        else:
+            break
+    return current, since_date, days
 
 
 # ----------------------------------------------------------------------------
@@ -152,9 +170,10 @@ def scan(tickers=TICKERS):
             hist = compute_indicators(hist)
             last, prev = hist.iloc[-1], hist.iloc[-2]
             pct_change = (last["Close"] - prev["Close"]) / prev["Close"] * 100
-            signal = classify_signal(hist)
+            signal, since_date, days_held = current_signal_info(hist)
             rows.append({
                 "Symbol": code,
+                "Date": hist.index[-1].strftime("%Y-%m-%d"),
                 "Close": round(float(last["Close"]), 2),
                 "ChangePct": round(float(pct_change), 2),
                 "Volume": int(last["Volume"]),
@@ -162,6 +181,8 @@ def scan(tickers=TICKERS):
                 "SMA20": round(float(last["sma20"]), 2) if pd.notna(last["sma20"]) else None,
                 "SMA50": round(float(last["sma50"]), 2) if pd.notna(last["sma50"]) else None,
                 "Signal": signal,
+                "SignalSince": since_date.strftime("%Y-%m-%d") if since_date is not None else None,
+                "SignalDays": days_held,
             })
         except Exception as e:
             print(f"  {code}: error {e}")
@@ -186,33 +207,44 @@ def _table_html(sub_df, cols, headers):
 def write_html(df: pd.DataFrame):
     """Write a shareable static HTML report to docs/index.html (for GitHub Pages)."""
     today = dt.date.today().isoformat()
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_th = dt.datetime.utcnow() + dt.timedelta(hours=7)  # GitHub Actions runs in UTC; convert to Thailand time
+    now_str = now_th.strftime("%Y-%m-%d %H:%M")
 
     if df.empty:
         gainers = losers = buys = sells = df
+        data_date = "—"
     else:
         gainers = df.sort_values("ChangePct", ascending=False).head(20)
         losers = df.sort_values("ChangePct", ascending=True).head(20)
-        buys = df[df["Signal"] == "BUY"].sort_values("ChangePct", ascending=False)
-        sells = df[df["Signal"] == "SELL"].sort_values("ChangePct", ascending=True)
+        buys = df[df["Signal"] == "BUY"].sort_values("SignalDays", ascending=False)
+        sells = df[df["Signal"] == "SELL"].sort_values("SignalDays", ascending=False)
+        # Most common last-trading-date across tickers = the actual data date
+        data_date = df["Date"].mode().iloc[0] if "Date" in df.columns and not df["Date"].empty else "—"
 
     def fmt_pct(v):
         return f"+{v:.2f}%" if v >= 0 else f"{v:.2f}%"
 
-    def with_fmt(sub):
+    def fmt_since(row):
+        if row.get("SignalSince") is None:
+            return "—"
+        return f"{row['SignalSince']} ({int(row['SignalDays'])} วันทำการ)"
+
+    def with_fmt(sub, add_since=False):
         sub = sub.copy()
         if not sub.empty:
             sub["ChangePct"] = sub["ChangePct"].apply(fmt_pct)
+            if add_since:
+                sub["Since"] = sub.apply(fmt_since, axis=1)
         return sub
 
     gainers_html = _table_html(with_fmt(gainers), ["Symbol", "Close", "ChangePct", "Volume", "Signal"],
                                 ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "วอลุ่ม", "สัญญาณ"])
     losers_html = _table_html(with_fmt(losers), ["Symbol", "Close", "ChangePct", "Volume", "Signal"],
                                ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "วอลุ่ม", "สัญญาณ"])
-    buys_html = _table_html(with_fmt(buys), ["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50"],
-                             ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "RSI14", "SMA20", "SMA50"])
-    sells_html = _table_html(with_fmt(sells), ["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50"],
-                              ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "RSI14", "SMA20", "SMA50"])
+    buys_html = _table_html(with_fmt(buys, add_since=True), ["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50", "Since"],
+                             ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "RSI14", "SMA20", "SMA50", "เป็นสัญญาณนี้มาตั้งแต่"])
+    sells_html = _table_html(with_fmt(sells, add_since=True), ["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50", "Since"],
+                              ["Symbol", "ราคาปิด", "% เปลี่ยนแปลง", "RSI14", "SMA20", "SMA50", "เป็นสัญญาณนี้มาตั้งแต่"])
 
     html = f"""<!DOCTYPE html>
 <html lang="th">
@@ -236,7 +268,7 @@ def write_html(df: pd.DataFrame):
 <body>
 <div class="wrap">
   <h1>SET Daily Scan</h1>
-  <div class="updated">อัปเดตล่าสุด: {now} น.</div>
+  <div class="updated">ข้อมูลราคาปิดล่าสุด ณ วันที่: <strong style="color:#e8e4d8">{data_date}</strong> &nbsp;•&nbsp; ระบบรันล่าสุดเมื่อ: {now_str} น. (เวลาไทย)</div>
 
   <h2>Top 20 Gainers</h2>
   {gainers_html}
@@ -279,20 +311,20 @@ def print_report(df: pd.DataFrame):
     print("\n--- Top 20 Losers ---")
     print(losers[["Symbol", "Close", "ChangePct", "Volume", "Signal"]].to_string(index=False))
 
-    buys = df[df["Signal"] == "BUY"].sort_values("ChangePct", ascending=False)
-    sells = df[df["Signal"] == "SELL"].sort_values("ChangePct", ascending=True)
+    buys = df[df["Signal"] == "BUY"].sort_values("SignalDays", ascending=False)
+    sells = df[df["Signal"] == "SELL"].sort_values("SignalDays", ascending=False)
 
     print(f"\n--- สัญญาณ BUY ({len(buys)} ตัว) ---")
     if buys.empty:
         print("(ไม่มีหุ้นเข้าเงื่อนไข BUY วันนี้)")
     else:
-        print(buys[["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50"]].to_string(index=False))
+        print(buys[["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50", "SignalSince", "SignalDays"]].to_string(index=False))
 
     print(f"\n--- สัญญาณ SELL ({len(sells)} ตัว) ---")
     if sells.empty:
         print("(ไม่มีหุ้นเข้าเงื่อนไข SELL วันนี้)")
     else:
-        print(sells[["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50"]].to_string(index=False))
+        print(sells[["Symbol", "Close", "ChangePct", "RSI14", "SMA20", "SMA50", "SignalSince", "SignalDays"]].to_string(index=False))
 
     print("\n⚠️  สัญญาณข้างต้นคำนวณจากกฎ SMA/RSI/MACD ล้วนๆ ไม่ใช่คำแนะนำการลงทุน")
     print("    ควรตรวจสอบข้อมูลพื้นฐาน ข่าว และความเสี่ยงส่วนตัวก่อนตัดสินใจทุกครั้ง\n")
