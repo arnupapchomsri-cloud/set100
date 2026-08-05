@@ -1,0 +1,36 @@
+name: SET Daily Scan
+
+on:
+  schedule:
+    # 10:00 UTC = 17:00 เวลาไทย, วันจันทร์-ศุกร์ (หลังตลาดหุ้นปิด)
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch: {}   # ปุ่มให้กดรันเองได้ทันทีจากหน้า GitHub ด้วย
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install yfinance pandas
+
+      - name: Run daily scan
+        run: python set_daily_scan.py
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html set_scan_output/*.csv
+          git diff --quiet --cached || git commit -m "Daily SET scan update"
+          git push
