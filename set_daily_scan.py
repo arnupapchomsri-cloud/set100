@@ -147,7 +147,7 @@ def current_signal_info(df: pd.DataFrame):
 # 3) Main scan
 # ----------------------------------------------------------------------------
 def scan(tickers=TICKERS):
-    end = dt.date.today()
+    end = dt.date.today() + dt.timedelta(days=1)  # yfinance treats 'end' as exclusive; +1 day so today's own bar is included once published
     start = end - dt.timedelta(days=LOOKBACK_DAYS)
     yf_symbols = [f"{t}.BK" for t in tickers]
 
